@@ -11,3 +11,12 @@ Makefile.in
 /depcomp
 /install-sh
 /missing
+
+# generated
+.deps
+.dirstamp
+/TAGS
+/Makefile
+/monitord
+/config.*
+*.o
