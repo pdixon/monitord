@@ -75,7 +75,7 @@ static void take_inhibit_cb(GObject *source_object,
     context->state.lid_inhibit_fd = g_unix_fd_list_get(fd_list, fd_index, &error);
     if (context->state.lid_inhibit_fd == -1) {
         log_warn("Error getting file descriptor for lid inhibitor lock: %s",
-                   error->message);
+                 error->message);
         g_error_free(error);
     }
     g_variant_unref(result);
@@ -118,13 +118,15 @@ static void release_inhibit(Context *context)
 
 void print_state(SystemState state)
 {
-    log_info("System state: bat: %d lid_inhibit: %d, lid_present: %d lid_closed: %d, ext_present: %d, ext_active: %d",
+    log_info("System state: bat: %d lid_i: %d, lid_p: %d lid_c: %d, ext_p: %d, ext_a: %d, int_p: %d, int_a: %d",
              state.on_battery,
              state.lid_inhibit_fd,
              state.lid_present,
              state.lid_closed,
              state.ext_display_present,
-             state.ext_display_active);
+             state.ext_display_active,
+             state.int_display_present,
+             state.int_display_active);
 }
 
 void apply(Context *c)
@@ -165,26 +167,20 @@ void apply(Context *c)
     }
 }
 
-void handle_output_change(Context *c, xcb_randr_notify_event_t *e)
+void handle_output(Context *c, xcb_randr_get_output_info_reply_t *output)
 {
-    xcb_randr_get_output_info_cookie_t info;
-    xcb_randr_get_output_info_reply_t *reply;
-    xcb_randr_output_change_t *change = &e->u.oc;
-    info = xcb_randr_get_output_info(c->c, change->output, 0);
-    reply = xcb_randr_get_output_info_reply(c->c, info, 0);
     cleanup_free const char *name = ({
-            uint8_t *name = xcb_randr_get_output_info_name(reply);
-            int len = xcb_randr_get_output_info_name_length(reply);
+            uint8_t *name = xcb_randr_get_output_info_name(output);
+            int len = xcb_randr_get_output_info_name_length(output);
             strndup((char *)name, len);
         });
     if(!strcmp(name, "DVI1")) {
-        c->state.ext_display_present = change->connection == 0 ? TRUE : FALSE;
-        c->state.ext_display_active = change->crtc ? TRUE : FALSE;
+        c->state.ext_display_present = output->connection == 0 ? TRUE : FALSE;
+        c->state.ext_display_active = output->crtc ? TRUE : FALSE;
     } else if (!strcmp(name, "LVDS1")) {
-        c->state.int_display_present = change->connection == 0 ? TRUE : FALSE;
-        c->state.int_display_active = change->crtc ? TRUE : FALSE;
+        c->state.int_display_present = output->connection == 0 ? TRUE : FALSE;
+        c->state.int_display_active = output->crtc ? TRUE : FALSE;
     }
-    apply(c);
 }
 
 static gboolean handle_xcb_event(xcb_generic_event_t *event,
@@ -198,7 +194,14 @@ static gboolean handle_xcb_event(xcb_generic_event_t *event,
     switch((event->response_type & ~0x80) - context->event_base) {
         case XCB_RANDR_NOTIFY_OUTPUT_CHANGE:
             log_info("xcb output changed");
-            handle_output_change(context, (xcb_randr_notify_event_t *)event);
+            xcb_randr_get_output_info_cookie_t info;
+            xcb_randr_get_output_info_reply_t *reply;
+            xcb_randr_output_change_t *change = &((xcb_randr_notify_event_t *)event)->u.oc;
+            info = xcb_randr_get_output_info(context->c, change->output, 0);
+            reply = xcb_randr_get_output_info_reply(context->c, info, 0);
+            handle_output(context, reply);
+            free(reply);
+            apply(context);
             break;
         default:
             log_info("Unknown xcb event.");
@@ -223,6 +226,59 @@ static void on_upower_changed(UpClient *client,
     context->state.lid_present = up_client_get_lid_is_present(client);
     context->state.lid_closed = up_client_get_lid_is_closed(client);
     apply(context);
+}
+
+void randr_scan_outputs(Context *context, xcb_window_t root)
+{
+    xcb_connection_t *conn = context->c;
+    xcb_randr_get_screen_resources_current_cookie_t r_cookie;
+    xcb_randr_get_output_primary_cookie_t p_cookie;
+
+    xcb_randr_get_output_primary_reply_t *primary;
+    xcb_randr_get_screen_resources_current_reply_t *res;
+
+    xcb_timestamp_t config_ts;
+
+    xcb_randr_output_t *randr_outputs;
+
+    r_cookie = xcb_randr_get_screen_resources_current(conn, root);
+    p_cookie = xcb_randr_get_output_primary(conn, root);
+
+    primary = xcb_randr_get_output_primary_reply(conn, p_cookie, NULL);
+    if(!primary) {
+        log_err("Couldn't get RandR primary output");
+        return;
+    }
+
+    res = xcb_randr_get_screen_resources_current_reply(conn, r_cookie, NULL);
+    if(!res){
+        log_err("Couldn't get RandR screen resources");
+    }
+    config_ts = res->config_timestamp;
+
+    int len;
+    len = xcb_randr_get_screen_resources_current_outputs_length(res);
+    randr_outputs = xcb_randr_get_screen_resources_current_outputs(res);
+
+    xcb_randr_get_output_info_cookie_t out_cookies[len];
+    for(int i = 0; i < len; i++) {
+        out_cookies[i] = xcb_randr_get_output_info(conn,
+                                                   randr_outputs[i],
+                                                   config_ts);
+    }
+
+    for(int i = 0; i < len; i++) {
+        xcb_randr_get_output_info_reply_t *output;
+
+        output = xcb_randr_get_output_info_reply(conn, out_cookies[i], NULL);
+        if(!output) {
+            continue;
+        }
+        handle_output(context, output);
+        free(output);
+    }
+    free(res);
+    free(primary);
 }
 
 int main(int argc, char *argv[])
@@ -279,10 +335,10 @@ int main(int argc, char *argv[])
     check(root, "Failed to retrive X11 root");
 
     xcb = pd_xcb_source_new(NULL,
-                           c,
-                           &handle_xcb_event,
-                           &context,
-                           NULL);
+                            c,
+                            &handle_xcb_event,
+                            &context,
+                            NULL);
     check(xcb, "Failed to init xcb g_source");
 
     xcb_randr_select_input(c,root->root,XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE);
@@ -298,12 +354,8 @@ int main(int argc, char *argv[])
     context.state.lid_present = up_client_get_lid_is_present(client);
     context.state.lid_closed = up_client_get_lid_is_closed(client);
 
-    // TODO probe display status at startup rather than assuming.
-    context.state.ext_display_present = FALSE;
-    context.state.ext_display_active = FALSE;
-
-    context.state.int_display_present = TRUE;
-    context.state.int_display_active = TRUE;
+    // Probe display status at startup rather than assuming.
+    randr_scan_outputs(&context, root->root);
 
     apply(&context);
 
